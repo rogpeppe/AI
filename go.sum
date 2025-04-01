@@ -1,4 +1,4 @@
 9fans.net/go v0.0.4 h1:g7K+b5I1PlSBFLnjuco3LAx5boK39UUl0Gsrmw6Gl2U=
 9fans.net/go v0.0.4/go.mod h1:lfPdxjq9v8pVQXUMBCx5EO5oLXWQFlKRQgs1kEkjoIM=
-github.com/sashabaranov/go-openai v1.9.5 h1:z1VCMXsfnug+U0ceTTIXr/L26AYl9jafqA9lptlSX0c=
-github.com/sashabaranov/go-openai v1.9.5/go.mod h1:lj5b/K+zjTSFxVLijLSTDZuP7adOgerWeFyZLUhAKRg=
+github.com/sashabaranov/go-openai v1.38.1 h1:TtZabbFQZa1nEni/IhVtDF/WQjVqDgd+cWR5OeddzF8=
+github.com/sashabaranov/go-openai v1.38.1/go.mod h1:lj5b/K+zjTSFxVLijLSTDZuP7adOgerWeFyZLUhAKRg=
