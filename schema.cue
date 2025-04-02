@@ -1,13 +1,20 @@
 package main
 
 // #Reply describes the full JSON response.
-#Reply:
-	#Commentary |
+#Reply: {
+	// parts holds a sequence of parts of the reply.
+	// The client will see each part as it arrives and
+	// act accordingly. Use #Commentary parts for describing
+	// your thinking as you're arriving at an answer.
+	parts: [... #ReplyPart]
+}
+
+#ReplyPart: #Commentary |
 	#FullContent |
 	#SelectionAppend |
 	#SelectionReplace |
 	#SelectionInsert |
-	#FurtherInstructionNeeded	@go(,type=struct{reply})
+	#FurtherInstructionNeeded	@go(,type=struct{replyPart})
 
 // #GenericReply describes the structure shared by all
 // reply messages.

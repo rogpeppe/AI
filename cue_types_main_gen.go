@@ -3,7 +3,15 @@
 package main
 
 // #Reply describes the full JSON response.
-type Reply struct{ reply }
+type Reply struct {
+	// parts holds a sequence of parts of the reply.
+	// The client will see each part as it arrives and
+	// act accordingly. Use #Commentary parts for describing
+	// your thinking as you're arriving at an answer.
+	Parts []ReplyPart `json:"parts"`
+}
+
+type ReplyPart struct{ replyPart }
 
 // #GenericReply describes the structure shared by all
 // reply messages.

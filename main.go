@@ -6,18 +6,18 @@ import (
 	"crypto/rand"
 	_ "embed"
 	"encoding/base64"
-	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
-	"io"
+	"iter"
 	"os"
 	"slices"
 	"strings"
 	"unicode/utf8"
 
 	"9fans.net/go/acme"
-	"github.com/sashabaranov/go-openai"
+	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/responses"
+	"github.com/openai/openai-go/shared"
 )
 
 //go:generate cue exp gengotypes
@@ -50,7 +50,7 @@ Each part is in JSON format described by the CUE #Part schema.
 
 var (
 	flagBig     = flag.Bool("big", false, "allow large files")
-	flagModel   = flag.String("m", openai.GPT4oLatest, "OpenAI model to use")
+	flagModel   = flag.String("m", string(openai.ChatModelGPT4o), "OpenAI model to use")
 	flagVerbose = flag.Bool("v", false, "enable verbose output")
 )
 
@@ -65,7 +65,6 @@ Any files provided will be attached as context.
 `)
 		os.Exit(2)
 	}
-
 	flag.Parse()
 
 	win, err := acmeCurrentWin()
@@ -78,7 +77,6 @@ Any files provided will be attached as context.
 	if key == "" {
 		return fmt.Errorf("no value set for $OPENAI_API_KEY")
 	}
-	client := openai.NewClient(key)
 
 	var parts []Part
 	parts = append(parts, Part{
@@ -91,6 +89,7 @@ Any files provided will be attached as context.
 		return err
 	}
 	parts = append(parts, part)
+
 	args := flag.Args()
 	if len(args) > 0 {
 		parts = append(parts, Part{
@@ -119,82 +118,90 @@ Any files provided will be attached as context.
 			Content:      string(data),
 		})
 	}
-	var msgs []openai.ChatCompletionMessage
-	msgs = append(msgs, openai.ChatCompletionMessage{
-		Role:    openai.ChatMessageRoleSystem,
-		Content: systemPrompt,
-	})
-	userMsg := openai.ChatCompletionMessage{
-		Role: openai.ChatMessageRoleUser,
+
+	// Build the messages
+	systemMsg := responses.EasyInputMessageParam{
+		Role: responses.EasyInputMessageRoleSystem,
+		Content: responses.EasyInputMessageContentUnionParam{
+			OfString: openai.Opt(systemPrompt),
+		},
 	}
-	for _, part := range parts {
-		aiPart, err := part.AsOpenAI()
+
+	var userContent bytes.Buffer
+	for _, p := range parts {
+		aiPart, err := p.AsOpenAI()
 		if err != nil {
 			return fmt.Errorf("cannot marshal part: %v", err)
 		}
-		userMsg.MultiContent = append(userMsg.MultiContent, aiPart)
+		userContent.WriteString(aiPart.Text)
+		userContent.WriteString("\n")
 	}
-	msgs = append(msgs, userMsg)
 
-	resp, err := client.CreateChatCompletionStream(context.Background(), openai.ChatCompletionRequest{
-		Model: *flagModel,
-		ResponseFormat: &openai.ChatCompletionResponseFormat{
-			Type: openai.ChatCompletionResponseFormatTypeJSONObject,
-			// TODO translate the CUE to JSON schema so we can fill in the JSONSchema field.
+	userMsg := responses.EasyInputMessageParam{
+		Role: responses.EasyInputMessageRoleUser,
+		Content: responses.EasyInputMessageContentUnionParam{
+			OfString: openai.Opt(userContent.String()),
 		},
-		Messages: msgs,
-	})
-	if err != nil {
-		return fmt.Errorf("cannot generate: %v (%#v)\n", err, err)
 	}
-	fmt.Printf("AI in progress: ")
 
-	var result bytes.Buffer
-	for {
-		resp, err := resp.Recv()
+	// Create the client, relying on OPENAI_API_KEY in env
+	client := openai.NewClient()
+
+	ctx := context.Background()
+	respIter := streamIter(client.Responses.NewStreaming(ctx, responses.ResponseNewParams{
+		Model: responses.ChatModel(*flagModel),
+		Input: responses.ResponseNewParamsInputUnion{
+			OfInputItemList: responses.ResponseInputParam{
+				{OfMessage: &systemMsg},
+				{OfMessage: &userMsg},
+			},
+		},
+		Text: responses.ResponseTextConfigParam{
+			Format: responses.ResponseFormatTextConfigUnionParam{
+				OfJSONObject: &shared.ResponseFormatJSONObjectParam{},
+			},
+		},
+	}))
+
+	var buf bytes.Buffer
+	for part, err := range partsIter(respIter, &buf) {
 		if err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			return fmt.Errorf("error receiving data: %v", err)
+			fmt.Printf("bad response:\n%s\n", buf.Bytes())
+			return fmt.Errorf("error receiving reply: %v", err)
 		}
-		if resp.Choices[0].FinishReason == "stop" {
-			break
+		var newBody []byte
+		switch r := part.AsAny().(type) {
+		case *FurtherInstructionNeeded:
+			fmt.Printf("further instruction needed: %s\n", r.Message)
+			continue
+		case *FullContent:
+			newBody = body.text
+		case *SelectionAppend:
+			body.selection = slices.Concat(body.selection, []byte(r.Text))
+			newBody = slices.Concat(body.head, body.selection, []byte(r.Text), body.tail)
+		case *SelectionInsert:
+			body.selection = slices.Concat([]byte(r.Text), body.selection)
+			newBody = slices.Concat(body.head, body.selection, body.tail)
+		case *SelectionReplace:
+			body.selection = []byte(r.Text)
+			newBody = slices.Concat(body.head, body.selection, body.tail)
+		case *Commentary:
+			fmt.Println(r.Text)
+			continue
+		default:
+			return fmt.Errorf("unhandled reply type %T", r)
 		}
-		result.WriteString(resp.Choices[0].Delta.Content)
-		fmt.Printf(".")
+
+		body.text = ensureNewline(body.text)
+		newBody = ensureNewline(newBody)
+		if err := doApply(win, body.text, newBody); err != nil {
+			// TODO: ouch: this is racy.
+			fmt.Printf("response:\n%s\n", buf.Bytes())
+			return fmt.Errorf("cannot apply results to acme window: %v", err)
+		}
+		body.text = newBody
 	}
 
-	var r reply
-	if err := json.Unmarshal(result.Bytes(), &r); err != nil {
-		fmt.Printf("bad response:\n%s\n", result.Bytes())
-		return fmt.Errorf("cannot unmarshal response: %v", err)
-	}
-	var newBody []byte
-	switch r := r.AsAny().(type) {
-	case *FurtherInstructionNeeded:
-		fmt.Printf("further instruction needed: %s\n", r.Message)
-		return nil
-	case *FullContent:
-		newBody = body.text
-	case *SelectionAppend:
-		newBody = slices.Concat(body.head, body.selection, []byte(r.Text), body.tail)
-	case *SelectionInsert:
-		newBody = slices.Concat(body.head, []byte(r.Text), body.selection, body.tail)
-	case *SelectionReplace:
-		newBody = slices.Concat(body.head, []byte(r.Text), body.tail)
-	case *Commentary:
-		fmt.Println(r.Text)
-		return nil
-	default:
-		return fmt.Errorf("unhandled reply type %T", r)
-	}
-	body.text = ensureNewline(body.text)
-	newBody = ensureNewline(newBody)
-	if err := doApply(win, body.text, newBody); err != nil {
-		fmt.Printf("response:\n%s\n", result.Bytes())
-		return fmt.Errorf("cannot apply results to acme window: %v", err)
-	}
 	return nil
 }
 
@@ -212,20 +219,20 @@ type bodyInfo struct {
 	tail      []byte
 }
 
-func currentFilePart(win *acme.Win) (p Part, info *bodyInfo, err error) {
+func currentFilePart(win *acme.Win) (part Part, info *bodyInfo, err error) {
 	var buf bytes.Buffer
 	if err := copyBody(&buf, win); err != nil {
 		return Part{}, nil, fmt.Errorf("cannot copy window body: %v", err)
 	}
 	body := buf.Bytes()
-	_, _, err = win.ReadAddr() // make sure address file is already open.
+
+	_, _, err = win.ReadAddr() // ensure address file is open
 	if err != nil {
 		return Part{}, nil, fmt.Errorf("cannot read address: %v", err)
 	}
 	if err := win.Ctl("addr=dot"); err != nil {
 		return Part{}, nil, fmt.Errorf("cannot set address: %v", err)
 	}
-	delim := []byte(uniqID())
 	a0, a1, err := win.ReadAddr()
 	if err != nil {
 		return Part{}, nil, fmt.Errorf("cannot get dot: %v", err)
@@ -236,6 +243,7 @@ func currentFilePart(win *acme.Win) (p Part, info *bodyInfo, err error) {
 	selection := body[a0b:a1b]
 	tail := body[a1b:]
 
+	delim := []byte(uniqID())
 	hbody := slices.Concat(
 		head,
 		delim,
@@ -250,16 +258,18 @@ func currentFilePart(win *acme.Win) (p Part, info *bodyInfo, err error) {
 	}
 	filename, _, _ := strings.Cut(string(tagBytes), " ")
 
-	return Part{
-			Instructions: fmt.Sprintf("Contents of the file currently being edited. The current selection is surrounded by the delimiter string %q", delim),
-			Filename:     filename,
-			Content:      string(hbody),
-		}, &bodyInfo{
-			text:      body,
-			head:      head,
-			selection: selection,
-			tail:      tail,
-		}, nil
+	part = Part{
+		Instructions: fmt.Sprintf("Contents of the file currently being edited. The current selection is surrounded by the delimiter string %q", delim),
+		Filename:     filename,
+		Content:      string(hbody),
+	}
+	info = &bodyInfo{
+		text:      body,
+		head:      head,
+		selection: selection,
+		tail:      tail,
+	}
+	return part, info, nil
 }
 
 func uniqID() string {
@@ -268,4 +278,23 @@ func uniqID() string {
 		panic(err)
 	}
 	return fmt.Sprintf("%x", buf)
+}
+
+type stream[T any] interface {
+	Next() bool
+	Current() T
+	Err() error
+}
+
+func streamIter[T any](s stream[T]) iter.Seq2[T, error] {
+	return func(yield func(T, error) bool) {
+		for s.Next() {
+			if !yield(s.Current(), s.Err()) {
+				if s, _ := s.(interface{ Close() }); s != nil {
+					s.Close()
+				}
+				return
+			}
+		}
+	}
 }

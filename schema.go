@@ -17,15 +17,15 @@ var replyTypes = map[string]reflect.Type{
 	"commentary":       reflect.TypeFor[Commentary](),
 }
 
-type reply struct {
+type replyPart struct {
 	content any
 }
 
-func (r *reply) AsAny() any {
+func (r *replyPart) AsAny() any {
 	return r.content
 }
 
-func (r *reply) UnmarshalJSON(data []byte) error {
+func (r *replyPart) UnmarshalJSON(data []byte) error {
 	var gr GenericReply
 	if err := json.Unmarshal(data, &gr); err != nil {
 		return err
